@@ -54,6 +54,7 @@ from hmac import new as hmac
 from random import getrandbits
 from time import time
 from urllib import urlencode
+from urllib import urlopen
 from urllib import quote as urlquote
 from urllib import unquote as urlunquote
 
@@ -65,6 +66,7 @@ YAHOO = "yahoo"
 MYSPACE = "myspace"
 DROPBOX = "dropbox"
 LINKEDIN = "linkedin"
+FACEBOOK = "facebook"
 
 
 class OAuthException(Exception):
@@ -87,6 +89,8 @@ def get_oauth_client(service, key, secret, callback_url):
     return DropboxClient(key, secret, callback_url)
   elif service == LINKEDIN:
     return LinkedInClient(key, secret, callback_url)
+  elif service == FACEBOOK:
+    return FacebookClient(key, secret, callback_url)
   else:
     raise Exception, "Unknown OAuth service %s" % service
 
@@ -581,3 +585,32 @@ class LinkedInClient(OAuthClient):
     user_info["picture"] = data["pictureUrl"]
     user_info["name"] = data["firstName"] + " " + data["lastName"]
     return user_info
+
+class FacebookClient:
+  """Facebook Client.
+
+  A client for talking to the Facebook API using OAuth as the
+  authentication model.
+  """
+
+  def __init__(self, consumer_key, consumer_secret, callback_url):
+    """Constructor."""
+    self.args = dict(client_id=consumer_key, redirect_uri=callback_url)
+    self.secret = consumer_secret
+    
+  def get_authorization_url(self):
+    return "https://graph.facebook.com/oauth/authorize?" + urlencode(self.args)
+    
+  def get_auth_token(self, verification_code):
+    if verification_code:
+      self.args["client_secret"] = self.secret
+      self.args["code"] = verification_code
+      response = cgi.parse_qs(urlopen("https://graph.facebook.com/oauth/access_token?" + urlencode(args)).read())
+      access_token = response["access_token"][-1]    
+      return access_token
+    return None
+    
+  def get_user_info(self, auth_token, auth_verifier=""):
+    profile = json.load(urlopen("https://graph.facebook.com/me?" + urlencode(dict(access_token=auth_token))))
+    return profile
+    
