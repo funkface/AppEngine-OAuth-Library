@@ -112,9 +112,9 @@ class AuthToken(db.Model):
   token = db.StringProperty(required=True)
   secret = db.StringProperty(required=True)
   created = db.DateTimeProperty(auto_now_add=True)
+    expires = db.DateTimeProperty()
 
-
-class OAuthClient():
+class OAuthClient(object):
 
   def __init__(self, service_name, consumer_key, consumer_secret, request_url,
                access_url, callback_url=None):
@@ -338,7 +338,8 @@ class OAuthClient():
       "id": "",
       "username": "",
       "name": "",
-      "picture": ""
+            "picture": "",
+            'service': self.service_name
     }
 
 
@@ -588,33 +589,148 @@ class LinkedInClient(OAuthClient):
     user_info["name"] = data["firstName"] + " " + data["lastName"]
     return user_info
 
-class FacebookClient:
+class FacebookClient(OAuthClient):
   """Facebook Client.
 
   A client for talking to the Facebook API using OAuth as the
   authentication model.
+
+    Facebook uses OAuth 2 which is a lot different than OAuth 1.
   """
 
   def __init__(self, consumer_key, consumer_secret, callback_url):
     """Constructor."""
     self.args = dict(client_id=consumer_key, redirect_uri=callback_url)
-    self.secret = consumer_secret
+
+        OAuthClient.__init__(self,
+             FACEBOOK,
+             consumer_key,
+             consumer_secret,
+             "no_request_tokens_for_fb_oauth_2",
+             "https://graph.facebook.com/oauth/access_token",
+             callback_url)
+
+    def _get_auth_token(self):
+        raise NotImplementedError, 'No request tokens used for facebook.'
     
   def get_authorization_url(self):
-    return "https://graph.facebook.com/oauth/authorize?" + urlencode(self.args)
-    
-  def get_auth_token(self, verification_code):
-    if verification_code:
-      self.args["client_secret"] = self.secret
-      self.args["code"] = verification_code
-      response = cgi.parse_qs(urlopen("https://graph.facebook.com/oauth/access_token?" + urlencode(args)).read())
-      access_token = response["access_token"][-1]    
-      return access_token
-    return None
+        return "https://graph.facebook.com/oauth/authorize?" + \
+            urlencode(self.args)
     
   def get_user_info(self, auth_token, auth_verifier=""):
-    profile = json.load(urlopen("https://graph.facebook.com/me?" + urlencode(dict(access_token=auth_token))))
-    return profile
+        """Get User Info.
+        Exchanges the auth token for an access token and returns a dictionary
+        of information about the authenticated user.
+        """
+
+        response = self._get_access_token(auth_token)
+
+        # Extract the access token/secret from the response.
+        result = self._extract_credentials(response)
+
+        # Try to collect some information about this user from the service.
+        user_info = self._lookup_user_info(result["token"])
+        user_info.update(result)
+
+        return user_info
+
+    def _get_access_token(self, auth_token):
+        if auth_token:
+
+            args = self.args
+            args["code"] = auth_token
+            #url = "https://graph.facebook.com/oauth/access_token?" + \
+            #    urlencode(args)
+
+            response = self.make_request(self.access_url,
+                secret=self.consumer_secret,
+                additional_params=args
+            )
+            #response = cgi.parse_qs(urlopen(url).read())
+            #access_token = response["access_token"][-1]
+
+            return response
+
+        logging.info('No AUTH_TOKEN provided')
+        return None
+
+    def prepare_request(self, url, token="", secret="", additional_params=None,
+                        method=urlfetch.GET, t=None, nonce=None):
+        """Prepare Request.
+        Simpler unauthenticated requests for Facebook OAuth 2
+        Returns the payload of the request.
+        """
+
+        def encode(text):
+            return urlquote(str(text), "~")
+
+        params = {}
+
+        if token:
+            params["access_token"] = token
+        elif self.callback_url:
+            params["redirect_uri"] = self.callback_url
+
+        if secret:
+            params["client_secret"] = secret
+
+        if additional_params:
+            params.update(additional_params)
+
+        for k, v in params.items():
+            if isinstance(v, unicode):
+                params[k] = v.encode('utf8')
+
+        # Construct the request payload and return it
+        return urlencode(params)
+
+    def _lookup_user_info(self, access_token, access_secret=''):
+        """Lookup User Info.
+        Lookup the user on Facebook.
+        """
+
+        response = self.make_request(
+            "https://graph.facebook.com/me",
+             token=access_token
+        )
+
+        data = json.loads(response.content)
+
+        user_info = self._get_default_user_info()
+        user_info["id"] = data["id"]
+        user_info["username"] = data["username"]
+        user_info["name"] = data["name"]
+        #user_info["picture"] = data["profile_image_url"]
+        #get profile pic seperately
+
+        return user_info
+
+    def _extract_credentials(self, result):
+        """Extract Credentials.
+        Returns an dictionary containing the token and secret (if present).
+        Throws an Exception otherwise.
+        """
+
+        token = None
+        expiry = None
+        parsed_results = parse_qs(result.content)
+
+        if "access_token" in parsed_results:
+            token = parsed_results["access_token"][0]
+
+        if "expires" in parsed_results:
+            expiry = parsed_results["expires"][0]
+
+        if not token or result.status_code != 200:
+            logging.error("Could not extract token/secret: %s" % result.content)
+            raise OAuthException("Problem talking to the service")
+
+        return {
+            "service": self.service_name,
+            "token": token,
+            "secret": '',
+            "expiry": expiry
+        }
     
 
 class YammerClient(OAuthClient):
