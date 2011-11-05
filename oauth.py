@@ -54,9 +54,9 @@ from hmac import new as hmac
 from random import getrandbits
 from time import time
 from urllib import urlencode
-from urllib import urlopen
 from urllib import quote as urlquote
 from urllib import unquote as urlunquote
+from datetime import datetime, timedelta
 
 import logging
 
@@ -98,7 +98,7 @@ def get_oauth_client(service, key, secret, callback_url):
     raise Exception, "Unknown OAuth service %s" % service
 
 
-class AuthToken(db.Model):
+class OAuthRequestToken(db.Model):
   """Auth Token.
 
   A temporary auth token that we will use to authenticate a user with a
@@ -112,6 +112,13 @@ class AuthToken(db.Model):
   token = db.StringProperty(required=True)
   secret = db.StringProperty(required=True)
   created = db.DateTimeProperty(auto_now_add=True)
+
+
+class OAuthAccessToken(db.Model):
+    service = db.StringProperty(required=True)
+    auth_token = db.StringProperty(required=True)
+    access_token = db.StringProperty(required=True)
+    access_secret = db.StringProperty()
     expires = db.DateTimeProperty()
 
 class OAuthClient(object):
@@ -227,40 +234,96 @@ class OAuthClient(object):
 
     auth_token = urlunquote(auth_token)
     auth_verifier = urlunquote(auth_verifier)
+        auth_secret = self._load_auth_secret(auth_token)
+
+        access_token = self._get_access_token(
+            auth_token, auth_verifier, auth_secret)
+
+        # Try to collect some information about this user from the service.
+        user_info = self._lookup_user_info(
+            access_token.access_token,
+            access_token.access_secret
+        )
+        user_info['service'] = self.service_name
+        user_info['auth_token'] = auth_token
+
+        return user_info
+
+    def _load_auth_secret(self, auth_token):
 
     auth_secret = memcache.get(self._get_memcache_auth_key(auth_token))
 
     if not auth_secret:
-      result = AuthToken.gql("""
-        WHERE
-          service = :1 AND
-          token = :2
-        LIMIT
-          1
-      """, self.service_name, auth_token).get()
+            result = OAuthRequestToken.all()\
+                .filter('service =', self.service_name)\
+                .filter('token =', auth_token)\
+                .get()
 
       if not result:
         logging.error("The auth token %s was not found in our db" % auth_token)
         raise Exception, "Could not find Auth Token in database"
-      else:
+
         auth_secret = result.secret
 
-    response = self.make_request(self.access_url,
+        return auth_secret
+
+    def _request_access_token(self, auth_token, auth_verifier, auth_secret):
+        response = self.make_request(
+            self.access_url,
                                  token=auth_token,
                                  secret=auth_secret,
-                                 additional_params={"oauth_verifier":
-                                                     auth_verifier})
+            additional_params={"oauth_verifier": auth_verifier}
+        )
 
-    # Extract the access token/secret from the response.
-    result = self._extract_credentials(response)
+        return self._extract_credentials(response)
 
-    # Try to collect some information about this user from the service.
-    user_info = self._lookup_user_info(result["token"], result["secret"])
-    user_info.update(result)
+    def _get_access_token(self, auth_token, auth_verifier='', auth_secret=''):
 
-    return user_info
+        memcache_key = "oauth_access_%s_%s" % (self.service_name, auth_token)
+        access_token = memcache.get(memcache_key)
 
-  def _get_auth_token(self):
+        if access_token: return access_token
+
+        access_token = OAuthAccessToken.all()\
+            .filter('service =', self.service_name)\
+            .filter('auth_token =', auth_token)\
+            .get()
+
+        now = datetime.now()
+
+        if access_token and access_token.expires:
+            expires = (access_token.expires - now).seconds
+
+            if expires <= 20:
+                access_token.delete()
+                access_token = None
+
+        if not access_token:
+            result = self._request_access_token(auth_token, auth_verifier, auth_secret)
+
+            if 'expires' in result:
+                expires = result['expires']
+                result['expires'] = now + timedelta(seconds=expires)
+            else:
+                expires = float('inf')
+                result['expires'] = None
+
+            access_token = OAuthAccessToken(
+                service=result['service'],
+                auth_token=auth_token,
+                access_token=result['token'],
+                access_secret=result['secret'],
+                expires=result['expires']
+            )
+            access_token.put()
+
+        max_cache_time = 20 * 60
+        cache_time = min(max_cache_time, expires)
+        memcache.set(memcache_key, access_token, time=cache_time)
+        return access_token
+
+
+    def _get_request_token(self):
     """Get Authorization Token.
 
     Actually gets the authorization token and secret from the service. The
@@ -275,7 +338,7 @@ class OAuthClient(object):
     auth_secret = result["secret"]
 
     # Save the auth token and secret in our database.
-    auth = AuthToken(service=self.service_name,
+        auth = OAuthRequestToken(service=self.service_name,
                      token=auth_token,
                      secret=auth_secret)
     auth.put()
@@ -364,12 +427,12 @@ class TwitterClient(OAuthClient):
   def get_authorization_url(self):
     """Get Authorization URL."""
 
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return "http://api.twitter.com/oauth/authorize?oauth_token=%s" % token
 
   def get_authenticate_url(self):
     """Get Authentication URL."""
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return "http://api.twitter.com/oauth/authenticate?oauth_token=%s" % token
 
   def _lookup_user_info(self, access_token, access_secret):
@@ -414,7 +477,7 @@ class MySpaceClient(OAuthClient):
   def get_authorization_url(self):
     """Get Authorization URL."""
 
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return ("http://api.myspace.com/authorize?oauth_token=%s"
             "&oauth_callback=%s" % (token, urlquote(self.callback_url)))
 
@@ -460,7 +523,7 @@ class YahooClient(OAuthClient):
   def get_authorization_url(self):
     """Get Authorization URL."""
 
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return ("https://api.login.yahoo.com/oauth/v2/request_auth?oauth_token=%s"
             % token)
 
@@ -518,7 +581,7 @@ class DropboxClient(OAuthClient):
   def get_authorization_url(self):
     """Get Authorization URL."""
 
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return ("http://www.dropbox.com/0/oauth/authorize?"
             "oauth_token=%s&oauth_callback=%s" % (token,
                                                   urlquote(self.callback_url)))
@@ -563,7 +626,7 @@ class LinkedInClient(OAuthClient):
   def get_authorization_url(self):
     """Get Authorization URL."""
 
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return ("https://www.linkedin.com/uas/oauth/authenticate?oauth_token=%s"
             "&oauth_callback=%s" % (token, urlquote(self.callback_url)))
 
@@ -610,50 +673,6 @@ class FacebookClient(OAuthClient):
              "https://graph.facebook.com/oauth/access_token",
              callback_url)
 
-    def _get_auth_token(self):
-        raise NotImplementedError, 'No request tokens used for facebook.'
-    
-  def get_authorization_url(self):
-        return "https://graph.facebook.com/oauth/authorize?" + \
-            urlencode(self.args)
-    
-  def get_user_info(self, auth_token, auth_verifier=""):
-        """Get User Info.
-        Exchanges the auth token for an access token and returns a dictionary
-        of information about the authenticated user.
-        """
-
-        response = self._get_access_token(auth_token)
-
-        # Extract the access token/secret from the response.
-        result = self._extract_credentials(response)
-
-        # Try to collect some information about this user from the service.
-        user_info = self._lookup_user_info(result["token"])
-        user_info.update(result)
-
-        return user_info
-
-    def _get_access_token(self, auth_token):
-        if auth_token:
-
-            args = self.args
-            args["code"] = auth_token
-            #url = "https://graph.facebook.com/oauth/access_token?" + \
-            #    urlencode(args)
-
-            response = self.make_request(self.access_url,
-                secret=self.consumer_secret,
-                additional_params=args
-            )
-            #response = cgi.parse_qs(urlopen(url).read())
-            #access_token = response["access_token"][-1]
-
-            return response
-
-        logging.info('No AUTH_TOKEN provided')
-        return None
-
     def prepare_request(self, url, token="", secret="", additional_params=None,
                         method=urlfetch.GET, t=None, nonce=None):
         """Prepare Request.
@@ -684,6 +703,30 @@ class FacebookClient(OAuthClient):
         # Construct the request payload and return it
         return urlencode(params)
 
+    def get_authorization_url(self):
+        return "https://graph.facebook.com/oauth/authorize?" + \
+            urlencode(self.args)
+
+    def get_user_info(self, auth_token, auth_verifier=""):
+        """Get User Info.
+        Exchanges the auth token for an access token and returns a dictionary
+        of information about the authenticated user.
+
+        What we want for auth_token is what Facebook calls 'authorizaton code'
+        """
+
+        access_token = self._get_access_token(auth_token)
+
+        # Try to collect some information about this user from the service.
+        user_info = self._lookup_user_info(access_token.access_token)
+        user_info['service'] = self.service_name
+        user_info['auth_token'] = auth_token
+
+        return user_info
+
+    def _get_request_token(self):
+        raise NotImplementedError, 'No request tokens used for facebook.'
+
     def _lookup_user_info(self, access_token, access_secret=''):
         """Lookup User Info.
         Lookup the user on Facebook.
@@ -705,33 +748,32 @@ class FacebookClient(OAuthClient):
 
         return user_info
 
-    def _extract_credentials(self, result):
-        """Extract Credentials.
-        Returns an dictionary containing the token and secret (if present).
-        Throws an Exception otherwise.
-        """
+    def _request_access_token(self, auth_token, auth_verifier, auth_secret):
+        args = self.args
+        args["code"] = auth_token
 
-        token = None
-        expiry = None
+        result = self.make_request(self.access_url,
+            secret=self.consumer_secret,
+            additional_params=args
+        )
+
         parsed_results = parse_qs(result.content)
 
-        if "access_token" in parsed_results:
-            token = parsed_results["access_token"][0]
-
-        if "expires" in parsed_results:
-            expiry = parsed_results["expires"][0]
-
-        if not token or result.status_code != 200:
+        if result.status_code != 200 or "access_token" not in parsed_results:
             logging.error("Could not extract token/secret: %s" % result.content)
-            raise OAuthException("Problem talking to the service")
+            raise OAuthException, "Problem talking to the service"
 
-        return {
-            "service": self.service_name,
-            "token": token,
-            "secret": '',
-            "expiry": expiry
+        output = {
+            'service': self.service_name,
+            'token': parsed_results["access_token"][0],
+            'secret': None
         }
     
+        if "expires" in parsed_results:
+            output['expires'] = int(parsed_results["expires"][0])
+
+        return output
+
 
 class YammerClient(OAuthClient):
   """Yammer Client.
@@ -754,7 +796,7 @@ class YammerClient(OAuthClient):
   def get_authorization_url(self):
     """Get Authorization URL."""
 
-    token = self._get_auth_token()
+        token = self._get_request_token()
     return ("https://www.yammer.com/oauth/authorize?oauth_token=%s"
             "&oauth_callback=%s" % (token, urlquote(self.callback_url)))
 
